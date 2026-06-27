@@ -26,10 +26,13 @@ st.set_page_config(
 )
 
 # ── Database connection ───────────────────────────────────────────────────────
-# st.cache_resource caches the connection across user sessions.
-# Without this, Streamlit would reconnect to DuckDB on every interaction.
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "amr_surveillance.duckdb")
+
+if not os.path.exists(DB_PATH):
+    from setup_db import build_database
+    build_database(DB_PATH)
+    st.rerun()
 
 @st.cache_resource
 def get_connection():
