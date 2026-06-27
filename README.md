@@ -81,3 +81,11 @@ Pipeline covers global BV-BRC submissions. South Africa and the broader African 
 
 Active development: follow the commit history to see the build in progress.
 
+
+---
+
+## Live dashboard
+
+[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://amr-surveillance-menzisk.streamlit.app)
+
+> Replace the URL above with your actual Streamlit Cloud deployment URL.
