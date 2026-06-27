@@ -89,3 +89,9 @@ Active development: follow the commit history to see the build in progress.
 [![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://amr-surveillance-menzisk.streamlit.app)
 
 > Replace the URL above with your actual Streamlit Cloud deployment URL.
+
+---
+
+## Live dashboard
+
+[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://amr-surveillance-menzisk.streamlit.app)
