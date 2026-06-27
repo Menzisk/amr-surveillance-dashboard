@@ -39,13 +39,6 @@ ESKAPE_PATHOGENS = [
 ]
 
 # ── 2. API configuration ────────────────────────────────────────────────────
-#
-# BV-BRC exposes a public REST API. No authentication required for AMR data.
-#
-# Key parameters:
-#   eq(taxon_id,<ID>)  — filter by organism
-#   limit(<N>)         — max records per request (BV-BRC cap is 25000)
-#   http_accept        — we request JSON for reliable parsing
 
 BASE_URL = "https://www.bv-brc.org/api/genome_amr/"
 LIMIT    = 25000
@@ -59,11 +52,16 @@ HEADERS  = {
 RAW_DIR = "data/raw"
 os.makedirs(RAW_DIR, exist_ok=True)
 
-# ── 4. Download function ────────────────────────────────────────────────────
+# ── 4. Download function with cursor-based pagination ───────────────────────
 
 def download_amr_data(pathogen: dict) -> dict:
     """
-    Downloads AMR records for a single pathogen from BV-BRC.
+    Downloads ALL AMR records for a single pathogen from BV-BRC
+    using cursor-based pagination to exceed the 25,000 record limit.
+
+    BV-BRC returns an X-Cursor-Mark header with each response.
+    We pass that cursor back in the next request to get the next page.
+    Pagination ends when the cursor token stops changing.
 
     Parameters
     ----------
@@ -81,58 +79,85 @@ def download_amr_data(pathogen: dict) -> dict:
 
     print(f"\n[{name}]")
     print(f"  taxon_id : {taxon_id}")
-    print(f"  querying : {BASE_URL}")
 
-    # Build the RQL query string
-    # RQL = Resource Query Language: BV-BRC's filter syntax
-    # eq(field,value) means "where field equals value"
-    params = f"eq(taxon_id,{taxon_id})&limit({LIMIT})"
+    all_records  = []
+    cursor       = "*"          # BV-BRC cursor pagination starts with *
+    page         = 1
+    previous_cursor = None
 
-    try:
-        response = requests.get(
-            BASE_URL,
-            params=params,
-            headers=HEADERS,
-            timeout=120       # seconds, large datasets can be slow
+    while True:
+        print(f"  page {page:>3} | cursor: {cursor[:30]}...")
+
+        # Build RQL query with cursor
+        params = (
+            f"eq(taxon_id,{taxon_id})"
+            f"&limit({LIMIT})"
+            f"&cursor({cursor})"
+            f"&sort(+genome_id)"    # cursor pagination requires a sort field
         )
-        response.raise_for_status()   # raises an error for 4xx/5xx responses
 
-    except requests.exceptions.Timeout:
-        print(f"  ERROR: request timed out for {name}")
-        return {"name": name, "records": 0, "file": None, "status": "timeout"}
+        try:
+            response = requests.get(
+                BASE_URL,
+                params=params,
+                headers=HEADERS,
+                timeout=120
+            )
+            response.raise_for_status()
 
-    except requests.exceptions.RequestException as e:
-        print(f"  ERROR: {e}")
-        return {"name": name, "records": 0, "file": None, "status": "error"}
+        except requests.exceptions.Timeout:
+            print(f"  ERROR: timeout on page {page} for {name}")
+            break
 
-    # Parse response
-    data = response.json()
+        except requests.exceptions.RequestException as e:
+            print(f"  ERROR: {e}")
+            break
 
-    # BV-BRC returns either a list directly or a dict with a data key
-    if isinstance(data, list):
-        records = data
-    elif isinstance(data, dict) and "data" in data:
-        records = data["data"]
-    else:
-        records = []
+        # Parse records
+        data = response.json()
+        if isinstance(data, list):
+            records = data
+        elif isinstance(data, dict) and "data" in data:
+            records = data["data"]
+        else:
+            records = []
 
-    record_count = len(records)
-    print(f"  records  : {record_count:,}")
+        if not records:
+            print(f"  no records returned on page {page} — stopping")
+            break
 
-    # Save raw JSON
-    # Filename includes date so repeated runs don't overwrite each other
-    date_str  = datetime.today().strftime("%Y%m%d")
-    filename  = f"{short_name}_amr_{date_str}.json"
-    filepath  = os.path.join(RAW_DIR, filename)
+        all_records.extend(records)
+        print(f"  page {page:>3} | fetched {len(records):,} | total so far: {len(all_records):,}")
+
+        # Get the next cursor from response headers
+        next_cursor = response.headers.get("X-Cursor-Mark", cursor)
+
+        # If cursor hasn't changed, we've reached the last page
+        if next_cursor == previous_cursor or next_cursor == cursor:
+            print(f"  cursor unchanged — all pages fetched")
+            break
+
+        previous_cursor = cursor
+        cursor          = next_cursor
+        page           += 1
+        time.sleep(0.5)    # polite pause between pages
+
+    # Save all records to a single JSON file
+    total = len(all_records)
+    print(f"  total records: {total:,}")
+
+    date_str = datetime.today().strftime("%Y%m%d")
+    filename = f"{short_name}_amr_{date_str}.json"
+    filepath = os.path.join(RAW_DIR, filename)
 
     with open(filepath, "w") as f:
-        json.dump(records, f, indent=2)
+        json.dump(all_records, f, indent=2)
 
-    print(f"  saved    : {filepath}")
+    print(f"  saved: {filepath}")
 
     return {
         "name":    name,
-        "records": record_count,
+        "records": total,
         "file":    filepath,
         "status":  "ok"
     }
