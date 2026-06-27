@@ -32,6 +32,7 @@ FIELD_MAP = {
     "genome_name":             "genome_name",
     "taxon_id":                "taxon_id",
     "antibiotic":              "antibiotic",
+    "measurement":             "measurement",
     "measurement_sign":        "measurement_sign",
     "measurement_value":       "measurement_value",
     "measurement_unit":        "measurement_unit",
