@@ -1,0 +1,16 @@
+name: amr-surveillance
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pandas=2.2.2
+  - requests
+  - jupyter
+  - notebook
+  - pip
+  - pip:
+    - duckdb
+    - streamlit
+    - plotly
+    - watchdog
