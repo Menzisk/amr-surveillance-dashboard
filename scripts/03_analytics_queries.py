@@ -3,9 +3,18 @@
 -----------------------
 SQL analytics queries for the AMR surveillance dashboard.
 
-Each query answers a specific epidemiological question.
-Results are printed and saved to data/processed/ as TSVs
-ready for the Streamlit dashboard.
+Data note: BV-BRC Laboratory Method records contain raw MIC values,
+not interpreted R/S/I phenotype calls. All analysis is therefore
+MIC-based and coverage-based rather than resistance-rate-based.
+
+Queries:
+    Q1  — Record counts by organism
+    Q2  — Top antibiotics tested per organism
+    Q3  — MIC value distributions (top organism-antibiotic pairs)
+    Q4  — Surveillance coverage over time by organism
+    Q5  — Top 10 most tested organism-antibiotic combinations
+    Q6  — Laboratory typing method breakdown
+    Q7  — Median MIC by organism and antibiotic (key clinical pairs)
 
 Author: Menzisk
 """
@@ -20,139 +29,133 @@ os.makedirs(PROCESSED_DIR, exist_ok=True)
 
 con = duckdb.connect(DB_PATH)
 
-# ── QUERY 1: Record counts by organism ──────────────────────────────────────
-#
-# The simplest surveillance question: how many isolates do we have per species?
-# COUNT(*) counts every row. GROUP BY collapses rows with the same organism
-# into one summary row. ORDER BY DESC puts the largest first.
+def run_query(title, sql):
+    print(f"\n{'='*60}")
+    print(f"{title}")
+    print('='*60)
+    df = con.execute(sql).df()
+    print(df.to_string(index=False))
+    return df
 
-print("=" * 60)
-print("QUERY 1: Records by organism")
-print("=" * 60)
-
-q1 = """
+# ── Q1: Record counts by organism ────────────────────────────────────────────
+df1 = run_query("Q1: Records by organism", """
     SELECT
         organism,
-        COUNT(*) AS total_records
+        COUNT(*)                        AS total_records,
+        COUNT(DISTINCT antibiotic)      AS antibiotics_tested,
+        COUNT(DISTINCT genome_id)       AS unique_isolates
     FROM amr_records
     GROUP BY organism
     ORDER BY total_records DESC
-"""
-
-df1 = con.execute(q1).df()
-print(df1.to_string(index=False))
+""")
 df1.to_csv(f"{PROCESSED_DIR}/q1_records_by_organism.tsv", sep="\t", index=False)
 
-# ── QUERY 2: Top antibiotics tested per organism ─────────────────────────────
-#
-# Which antibiotics are most commonly tested for each pathogen?
-# This tells us where the surveillance focus lies clinically.
-#
-# New concept: we filter WHERE organism = specific value,
-# then count and rank antibiotics within that organism.
+# ── Q2: Top antibiotics per organism ─────────────────────────────────────────
+# New concept: we loop over organisms and run the same query per organism.
+# In SQL this is done with a WHERE clause filter.
+df2_all = []
+for organism in df1["organism"].tolist():
+    df_org = con.execute("""
+        SELECT
+            ? AS organism,
+            antibiotic,
+            COUNT(*) AS times_tested
+        FROM amr_records
+        WHERE organism = ?
+        GROUP BY antibiotic
+        ORDER BY times_tested DESC
+        LIMIT 10
+    """, [organism, organism]).df()
+    df2_all.append(df_org)
 
-print("\n" + "=" * 60)
-print("QUERY 2: Top 10 antibiotics tested for A. baumannii")
-print("=" * 60)
-
-q2 = """
-    SELECT
-        antibiotic,
-        COUNT(*) AS times_tested
-    FROM amr_records
-    WHERE organism = 'Acinetobacter baumannii'
-    GROUP BY antibiotic
-    ORDER BY times_tested DESC
-    LIMIT 10
-"""
-
-df2 = con.execute(q2).df()
+df2 = pd.concat(df2_all, ignore_index=True)
+print(f"\n{'='*60}\nQ2: Top antibiotics per organism\n{'='*60}")
 print(df2.to_string(index=False))
+df2.to_csv(f"{PROCESSED_DIR}/q2_top_antibiotics_per_organism.tsv", sep="\t", index=False)
 
-# ── QUERY 3: Resistance rates by organism ────────────────────────────────────
-#
-# The core surveillance metric: what proportion of isolates are resistant?
-#
-# New concepts:
-#   CASE WHEN ... THEN ... END  — conditional logic inside SQL
-#   AVG()  — average of a 0/1 flag = proportion
-#   ROUND() — round to decimal places
-#   HAVING — filter on aggregated results (like WHERE but after GROUP BY)
-#
-# We flag each record as 1 (Resistant) or 0 (not Resistant),
-# then AVG() those flags to get the resistance rate.
-#
-# We only look at records where measurement is a qualitative R/S/I call
-# (i.e. measurement_sign IS NULL and measurement is not a raw MIC number)
-
-print("\n" + "=" * 60)
-print("QUERY 3: Resistance rates by organism")
-print("=" * 60)
-
-q3 = """
+# ── Q3: Top organism-antibiotic combinations ──────────────────────────────────
+# New concept: concatenating two columns with || to make a label.
+# HAVING filters aggregated results — like WHERE but after GROUP BY.
+df3 = run_query("Q3: Top 15 organism-antibiotic combinations by test volume", """
     SELECT
         organism,
-        COUNT(*)                                                AS total_tested,
-        SUM(CASE WHEN measurement_sign = 'Resistant'
-                 THEN 1 ELSE 0 END)                            AS resistant_count,
-        ROUND(
-            100.0 * SUM(CASE WHEN measurement_sign = 'Resistant'
-                             THEN 1 ELSE 0 END) / COUNT(*), 1
-        )                                                       AS resistance_rate_pct
+        antibiotic,
+        COUNT(*)                                    AS times_tested,
+        COUNT(CASE WHEN measurement_value IS NOT NULL
+                   THEN 1 END)                      AS has_mic_value,
+        ROUND(AVG(measurement_value), 2)            AS mean_mic,
+        ROUND(MEDIAN(measurement_value), 2)         AS median_mic
     FROM amr_records
-    GROUP BY organism
-    HAVING COUNT(*) >= 100
-    ORDER BY resistance_rate_pct DESC
-"""
+    WHERE measurement_value IS NOT NULL
+    GROUP BY organism, antibiotic
+    HAVING COUNT(*) >= 50
+    ORDER BY times_tested DESC
+    LIMIT 15
+""")
+df3.to_csv(f"{PROCESSED_DIR}/q3_organism_antibiotic_mic_summary.tsv", sep="\t", index=False)
 
-df3 = con.execute(q3).df()
-print(df3.to_string(index=False))
-df3.to_csv(f"{PROCESSED_DIR}/q3_resistance_by_organism.tsv", sep="\t", index=False)
-
-# ── QUERY 4: Distinct measurement_sign values ────────────────────────────────
-#
-# Before we do more resistance analysis, let's see what values
-# measurement_sign actually contains — the raw data may surprise us.
-
-print("\n" + "=" * 60)
-print("QUERY 4: What values does measurement_sign contain?")
-print("=" * 60)
-
-q4 = """
-    SELECT
-        measurement_sign,
-        COUNT(*) AS n
-    FROM amr_records
-    GROUP BY measurement_sign
-    ORDER BY n DESC
-"""
-
-df4 = con.execute(q4).df()
-print(df4.to_string(index=False))
-
-# ── QUERY 5: Records by year ─────────────────────────────────────────────────
-#
-# Temporal trend — when were these isolates collected/inserted?
-# Useful for showing how surveillance coverage has grown over time.
-
-print("\n" + "=" * 60)
-print("QUERY 5: Records inserted by year")
-print("=" * 60)
-
-q5 = """
+# ── Q4: Surveillance coverage over time ──────────────────────────────────────
+# New concept: filtering a range with BETWEEN.
+# This query shows how many records were added each year per organism —
+# a proxy for how surveillance intensity has changed over time.
+df4 = run_query("Q4: Records by year and organism", """
     SELECT
         year_inserted,
+        organism,
         COUNT(*) AS records
     FROM amr_records
-    WHERE year_inserted IS NOT NULL
-      AND year_inserted BETWEEN 2000 AND 2026
-    GROUP BY year_inserted
-    ORDER BY year_inserted
-"""
+    WHERE year_inserted BETWEEN 2010 AND 2026
+    GROUP BY year_inserted, organism
+    ORDER BY year_inserted, records DESC
+""")
+df4.to_csv(f"{PROCESSED_DIR}/q4_records_by_year_organism.tsv", sep="\t", index=False)
 
-df5 = con.execute(q5).df()
-print(df5.to_string(index=False))
-df5.to_csv(f"{PROCESSED_DIR}/q5_records_by_year.tsv", sep="\t", index=False)
+# ── Q5: Laboratory typing method breakdown ────────────────────────────────────
+# Which AST methods are used? Broth dilution, agar dilution, E-test?
+# Important for methodological context in surveillance.
+df5 = run_query("Q5: Laboratory typing methods", """
+    SELECT
+        laboratory_typing_method,
+        COUNT(*)                        AS n,
+        COUNT(DISTINCT organism)        AS organisms_covered
+    FROM amr_records
+    WHERE laboratory_typing_method IS NOT NULL
+    GROUP BY laboratory_typing_method
+    ORDER BY n DESC
+""")
+df5.to_csv(f"{PROCESSED_DIR}/q5_typing_methods.tsv", sep="\t", index=False)
+
+# ── Q6: Key clinical MIC summary ─────────────────────────────────────────────
+# For the most clinically critical antibiotic-organism pairs,
+# what does the MIC distribution look like?
+# These pairs are selected based on WHO critical priority pathogens
+# and their first-line or last-resort antibiotics.
+df6 = run_query("Q6: Key clinical pairs — MIC summary", """
+    SELECT
+        organism,
+        antibiotic,
+        COUNT(*)                        AS n,
+        ROUND(MIN(measurement_value),2) AS mic_min,
+        ROUND(MEDIAN(measurement_value),2) AS mic_median,
+        ROUND(MAX(measurement_value),2) AS mic_max,
+        ROUND(AVG(measurement_value),2) AS mic_mean
+    FROM amr_records
+    WHERE measurement_value IS NOT NULL
+      AND (
+          (organism = 'Acinetobacter baumannii'  AND antibiotic IN ('imipenem','meropenem','colistin','ciprofloxacin'))
+       OR (organism = 'Klebsiella pneumoniae'    AND antibiotic IN ('meropenem','imipenem','colistin','tigecycline'))
+       OR (organism = 'Pseudomonas aeruginosa'   AND antibiotic IN ('meropenem','imipenem','ciprofloxacin','colistin'))
+       OR (organism = 'Staphylococcus aureus'    AND antibiotic IN ('oxacillin','vancomycin','linezolid','daptomycin'))
+       OR (organism = 'Enterococcus faecium'     AND antibiotic IN ('vancomycin','linezolid','daptomycin','ampicillin'))
+       OR (organism = 'Enterobacter cloacae'     AND antibiotic IN ('meropenem','imipenem','ciprofloxacin','ceftriaxone'))
+      )
+    GROUP BY organism, antibiotic
+    HAVING COUNT(*) >= 10
+    ORDER BY organism, antibiotic
+""")
+df6.to_csv(f"{PROCESSED_DIR}/q6_key_clinical_pairs_mic.tsv", sep="\t", index=False)
 
 con.close()
-print("\nAll queries complete. TSVs saved to data/processed/")
+print(f"\n{'='*60}")
+print("All queries complete.")
+print(f"TSVs saved to {PROCESSED_DIR}/")
