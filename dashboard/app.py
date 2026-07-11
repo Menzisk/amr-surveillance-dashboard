@@ -34,11 +34,43 @@ if not os.path.exists(DB_PATH):
     build_database(DB_PATH)
     st.rerun()
 
+# ── Ensure enriched view exists (write connection, runs once before cache) ────
+def ensure_enriched_view():
+    _con = duckdb.connect(DB_PATH)
+    tables = _con.execute("SHOW TABLES").df()["name"].tolist()
+    if "genome_metadata" not in tables:
+        _con.execute("""
+            CREATE TABLE IF NOT EXISTS genome_metadata (
+                genome_id VARCHAR, isolation_country VARCHAR,
+                host_name VARCHAR, host_group VARCHAR,
+                host_common_name VARCHAR, collection_date VARCHAR,
+                genome_quality VARCHAR, genome_status VARCHAR,
+                sequencing_status VARCHAR
+            )
+        """)
+    views = _con.execute("SHOW TABLES").df()["name"].tolist()
+    if "amr_enriched" not in views:
+        _con.execute("""
+            CREATE VIEW IF NOT EXISTS amr_enriched AS
+            SELECT
+                a.record_id, a.genome_id, a.organism, a.antibiotic,
+                a.measurement, a.measurement_sign, a.measurement_value,
+                a.measurement_unit, a.laboratory_typing_method, a.year_inserted,
+                g.isolation_country, g.host_name, g.host_group,
+                g.collection_date, g.genome_quality
+            FROM amr_records a
+            LEFT JOIN genome_metadata g ON a.genome_id = g.genome_id
+        """)
+    _con.close()
+
+ensure_enriched_view()
+
 @st.cache_resource
 def get_connection():
     return duckdb.connect(DB_PATH, read_only=True)
 
 con = get_connection()
+
 
 # ── Header ───────────────────────────────────────────────────────────────────
 
@@ -283,3 +315,132 @@ st.caption(
     "Laboratory Method records only · Computational predictions excluded · "
     "130,076 records across 6 ESKAPE pathogens"
 )
+
+st.divider()
+
+# ── Row 4: Global geographic heatmap ─────────────────────────────────────────
+
+st.subheader("Global AMR surveillance coverage")
+st.caption("Records by country · hover for pathogen breakdown")
+
+df_geo = con.execute(f"""
+    SELECT
+        isolation_country,
+        organism,
+        COUNT(*) AS records
+    FROM amr_enriched
+    WHERE organism IN {org_filter}
+    AND {year_filter}
+    AND isolation_country IS NOT NULL
+    GROUP BY isolation_country, organism
+    ORDER BY records DESC
+""").df()
+
+df_geo_total = df_geo.groupby("isolation_country")["records"].sum().reset_index()
+df_geo_total.columns = ["isolation_country", "total_records"]
+
+hover_text = {}
+for country, grp in df_geo.groupby("isolation_country"):
+    lines = [f"<b>{country}</b>"]
+    for _, row in grp.sort_values("records", ascending=False).iterrows():
+        lines.append(f"  {row['organism']}: {row['records']:,}")
+    hover_text[country] = "<br>".join(lines)
+
+df_geo_total["hover"] = df_geo_total["isolation_country"].map(hover_text)
+
+fig_map = go.Figure(go.Choropleth(
+    locations=df_geo_total["isolation_country"],
+    locationmode="country names",
+    z=df_geo_total["total_records"],
+    text=df_geo_total["hover"],
+    hovertemplate="%{text}<extra></extra>",
+    colorscale="Blues",
+    colorbar_title="Records",
+    marker_line_color="white",
+    marker_line_width=0.5,
+))
+
+fig_map.update_layout(
+    geo=dict(
+        showframe=False,
+        showcoastlines=True,
+        projection_type="natural earth",
+        bgcolor="rgba(0,0,0,0)",
+    ),
+    margin=dict(l=0, r=0, t=0, b=0),
+    height=450,
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(0,0,0,0)",
+)
+
+st.plotly_chart(fig_map, use_container_width=True)
+
+st.divider()
+
+# ── Row 5: African spotlight ──────────────────────────────────────────────────
+
+st.subheader("🌍 African AMR spotlight")
+st.caption("Contextualising surveillance gaps — African continent coverage")
+
+AFRICAN_COUNTRIES = [
+    "Algeria", "Angola", "Benin", "Botswana", "Burkina Faso", "Burundi",
+    "Cameroon", "Cape Verde", "Central African Republic", "Chad", "Comoros",
+    "Congo", "Democratic Republic of the Congo", "Djibouti", "Egypt",
+    "Equatorial Guinea", "Eritrea", "Eswatini", "Ethiopia", "Gabon",
+    "Gambia", "Ghana", "Guinea", "Guinea-Bissau", "Ivory Coast", "Kenya",
+    "Lesotho", "Liberia", "Libya", "Madagascar", "Malawi", "Mali",
+    "Mauritania", "Mauritius", "Morocco", "Mozambique", "Namibia", "Niger",
+    "Nigeria", "Rwanda", "Sao Tome and Principe", "Senegal", "Seychelles",
+    "Sierra Leone", "Somalia", "South Africa", "South Sudan", "Sudan",
+    "Tanzania", "Togo", "Tunisia", "Uganda", "Zambia", "Zimbabwe"
+]
+
+africa_tuple = str(tuple(AFRICAN_COUNTRIES))
+
+df_africa = con.execute(f"""
+    SELECT
+        isolation_country,
+        organism,
+        COUNT(*) AS records,
+        ROUND(MEDIAN(measurement_value), 2) AS median_mic
+    FROM amr_enriched
+    WHERE organism IN {org_filter}
+    AND isolation_country IN {africa_tuple}
+    AND {year_filter}
+    GROUP BY isolation_country, organism
+    ORDER BY records DESC
+""").df()
+
+if df_africa.empty:
+    st.info("No African records match current filters.")
+else:
+    col_a1, col_a2 = st.columns([2, 1])
+
+    with col_a1:
+        fig_africa = px.bar(
+            df_africa,
+            x="records",
+            y="isolation_country",
+            color="organism",
+            orientation="h",
+            labels={"records": "Records", "isolation_country": "", "organism": "Organism"},
+            title="Records by African country and pathogen",
+        )
+        fig_africa.update_layout(
+            height=350,
+            margin=dict(l=0, r=0, t=30, b=0),
+            legend=dict(font=dict(size=10)),
+        )
+        st.plotly_chart(fig_africa, use_container_width=True)
+
+    with col_a2:
+        total_africa = df_africa["records"].sum()
+        countries_africa = df_africa["isolation_country"].nunique()
+        st.metric("African records", f"{total_africa:,}")
+        st.metric("African countries", f"{countries_africa}")
+        pct = round(100 * total_africa / total, 1) if total > 0 else 0
+        st.metric("% of global dataset", f"{pct}%")
+        st.caption(
+            "African AMR surveillance remains underrepresented globally"
+            "a known gap highlighted by WHO GLASS."
+        )
